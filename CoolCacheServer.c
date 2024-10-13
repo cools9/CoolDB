@@ -79,6 +79,9 @@ char* get(HashMap* map, const char *key) {
 }
 
 void handleCommand(HashMap* db, char *command, int client_socket) {
+    struct timeval start, end;
+    gettimeofday(&start, NULL);  // Start time measurement
+
     char response[BUFFER_SIZE] = {0};
     char key[50], value[50];
     int ttl;
@@ -103,6 +106,16 @@ void handleCommand(HashMap* db, char *command, int client_socket) {
         snprintf(response, sizeof(response), "Invalid command!\n");
     }
 
+    send(client_socket, response, strlen(response), 0);
+
+    // End time measurement
+    gettimeofday(&end, NULL);
+    long seconds = end.tv_sec - start.tv_sec;
+    long microseconds = end.tv_usec - start.tv_usec;
+    double elapsed = seconds + microseconds*1e-6;
+
+    // Send time taken
+    snprintf(response, sizeof(response), "Time taken: %.6f seconds\n", elapsed);
     send(client_socket, response, strlen(response), 0);
 }
 
