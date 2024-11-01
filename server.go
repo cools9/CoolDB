@@ -1,8 +1,9 @@
 package main
 
 import (
-	"cooldb/cooldb"
 	"net/http"
+
+	"packages/vital/cooldb"
 
 	"github.com/gin-gonic/gin"
 )
