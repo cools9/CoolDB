@@ -2,114 +2,216 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
+	"path/filepath"
+	"sync"
 )
 
-func MakeDB(filename string) {
-	// Open the file with O_CREATE and O_EXCL flags
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-	if err != nil {
-		if os.IsExist(err) {
-			fmt.Printf("File %s already exists, skipping creation.\n", filename)
-		} else {
-			fmt.Printf("Failed to create file: %v\n", err)
-		}
-		return
-	}
-	defer file.Close()
-
-	fmt.Printf("File %s created successfully.\n", filename)
+type Operation struct {
+	Type  string `json:"type"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	TxID  int64  `json:"txid"`
 }
 
-func Set(filename string, key string, value string) {
-	// Open the file in append mode, create it if it doesn't exist
-	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Printf("Failed to open file: %v\n", err)
-		return
-	}
-	defer file.Close()
-
-	// Data to append
-	data := key + ":" + value + "\n"
-
-	// Write data to the file
-	_, err = file.WriteString(data)
-	if err != nil {
-		fmt.Printf("Failed to write to file: %v\n", err)
-		return
-	}
-
-	fmt.Printf("Data appended successfully to %s\n", filename)
+type DB struct {
+	filename  string
+	cache     map[string]string
+	mu        sync.RWMutex
+	writer    *bufio.Writer
+	file      *os.File
+	walFile   *os.File
+	walWriter *bufio.Writer
+	txCounter int64
+	activeTx  map[int64][]Operation
+	txMu      sync.Mutex
 }
 
-func countLines(filename string) (int, []string, error) {
-	// Open the file
-	file, err := os.Open(filename)
-	if err != nil {
-		return 0, nil, fmt.Errorf("failed to open file: %w", err)
+func NewDB(filename string) (*DB, error) {
+	dir := filepath.Dir(filename)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
 	}
-	defer file.Close()
 
-	// Create a scanner to read the file line by line
-	scanner := bufio.NewScanner(file)
-	var lines []string
-	lineCount := 0
+	walPath := filename + ".wal"
+	walFile, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
 
-	// Loop through each line
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		walFile.Close()
+		return nil, err
+	}
+
+	db := &DB{
+		filename:  filename,
+		cache:     make(map[string]string),
+		file:      file,
+		writer:    bufio.NewWriter(file),
+		walFile:   walFile,
+		walWriter: bufio.NewWriter(walFile),
+		activeTx:  make(map[int64][]Operation),
+	}
+
+	if err := db.recover(); err != nil {
+		return nil, err
+	}
+
+	return db, nil
+}
+
+func (db *DB) recover() error {
+	scanner := bufio.NewScanner(db.walFile)
 	for scanner.Scan() {
-		lineCount++
-		lines = append(lines, scanner.Text())
-	}
-
-	// Check for errors during scanning
-	if err := scanner.Err(); err != nil {
-		return 0, nil, fmt.Errorf("error reading file: %w", err)
-	}
-
-	return lineCount, lines, nil
-}
-
-func splitKeyValue(data string) (string, string, error) {
-	parts := strings.Split(data, ":")
-	if len(parts) != 2 {
-		return "", "", fmt.Errorf("invalid format, expected 'key:value'")
-	}
-	return parts[0], parts[1], nil
-}
-
-func Get(filename string, key string) {
-	_, lines, err := countLines(filename)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-
-
-	for _, line := range lines {
-		k, v, err := splitKeyValue(line)
-		if err != nil {
-			fmt.Printf("Skipping invalid line: %s\n", line)
+		var op Operation
+		if err := json.Unmarshal(scanner.Bytes(), &op); err != nil {
 			continue
 		}
-
-		if k == key {
-			fmt.Printf("Value found for key '%s': %s\n", key, v)
-			return
+		if op.Type == "commit" {
+			db.applyOperation(op)
 		}
 	}
+	return scanner.Err()
+}
 
-	fmt.Printf("Key '%s' not found.\n", key)
+func (db *DB) Begin() int64 {
+	db.txMu.Lock()
+	defer db.txMu.Unlock()
+
+	db.txCounter++
+	db.activeTx[db.txCounter] = make([]Operation, 0)
+	return db.txCounter
+}
+
+func (db *DB) Commit(txID int64) error {
+	db.txMu.Lock()
+	defer db.txMu.Unlock()
+
+	ops, exists := db.activeTx[txID]
+	if !exists {
+		return fmt.Errorf("transaction %d not found", txID)
+	}
+
+	for _, op := range ops {
+		data, _ := json.Marshal(op)
+		if _, err := db.walWriter.Write(append(data, '\n')); err != nil {
+			return err
+		}
+		db.applyOperation(op)
+	}
+
+	if err := db.walWriter.Flush(); err != nil {
+		return err
+	}
+
+	delete(db.activeTx, txID)
+	return nil
+}
+
+func (db *DB) Rollback(txID int64) error {
+	db.txMu.Lock()
+	defer db.txMu.Unlock()
+
+	delete(db.activeTx, txID)
+	return nil
+}
+
+func (db *DB) Set(txID int64, key, value string) error {
+	op := Operation{
+		Type:  "set",
+		Key:   key,
+		Value: value,
+		TxID:  txID,
+	}
+
+	db.txMu.Lock()
+	db.activeTx[txID] = append(db.activeTx[txID], op)
+	db.txMu.Unlock()
+
+	return nil
+}
+
+func (db *DB) Delete(txID int64, key string) error {
+	op := Operation{
+		Type: "delete",
+		Key:  key,
+		TxID: txID,
+	}
+
+	db.txMu.Lock()
+	db.activeTx[txID] = append(db.activeTx[txID], op)
+	db.txMu.Unlock()
+
+	return nil
+}
+
+func (db *DB) Get(key string) (string, bool) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	value, exists := db.cache[key]
+	return value, exists
+}
+
+func (db *DB) applyOperation(op Operation) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	switch op.Type {
+	case "set":
+		db.cache[op.Key] = op.Value
+	case "delete":
+		delete(db.cache, op.Key)
+	}
+}
+
+func (db *DB) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if err := db.walWriter.Flush(); err != nil {
+		return err
+	}
+	if err := db.writer.Flush(); err != nil {
+		return err
+	}
+	db.walFile.Close()
+	return db.file.Close()
 }
 
 func main() {
-	MakeDB("keyDB.cdb")
-	Set("keyDB.cdb", "Rishabh", "Cools9")
-	Set("keyDB.cdb", "Rishab", "Cools8")
+	db, err := NewDB("keyDB.cdb")
+	if err != nil {
+		fmt.Printf("Error creating DB: %v\n", err)
+		return
+	}
+	defer db.Close()
 
-	Get("keyDB.cdb", "Rishabh")
-	Get("keyDB.cdb", "Rishab")
-	Get("keyDB.cdb", "UnknownKey")
+	// Start transaction
+	txID := db.Begin()
+
+	// Set operations
+	db.Set(txID, "key1", "value1")
+	db.Set(txID, "key2", "value2")
+
+	// Delete operation
+	db.Delete(txID, "key1")
+
+	// Commit transaction
+	if err := db.Commit(txID); err != nil {
+		fmt.Printf("Commit error: %v\n", err)
+		return
+	}
+
+	// Read operations
+	if val, exists := db.Get("key2"); exists {
+		fmt.Printf("key2: %s\n", val)
+	}
+	if _, exists := db.Get("key1"); !exists {
+		fmt.Println("key1 was deleted")
+	}
 }
