@@ -35,7 +35,7 @@ func NewDB(filename string) (*DB, error) {
 		return nil, err
 	}
 
-	walPath := filename + ".wal"
+	walPath := filename
 	walFile, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
