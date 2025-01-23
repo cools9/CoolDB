@@ -1,4 +1,4 @@
-package main
+package utils
 
 import (
 	"bufio"
@@ -181,37 +181,4 @@ func (db *DB) Close() error {
 	}
 	db.walFile.Close()
 	return db.file.Close()
-}
-
-func main() {
-	db, err := NewDB("keyDB.cdb")
-	if err != nil {
-		fmt.Printf("Error creating DB: %v\n", err)
-		return
-	}
-	defer db.Close()
-
-	// Start transaction
-	txID := db.Begin()
-
-	// Set operations
-	db.Set(txID, "key1", "value1")
-	db.Set(txID, "key2", "value2")
-
-	// Delete operation
-	db.Delete(txID, "key1")
-
-	// Commit transaction
-	if err := db.Commit(txID); err != nil {
-		fmt.Printf("Commit error: %v\n", err)
-		return
-	}
-
-	// Read operations
-	if val, exists := db.Get("key2"); exists {
-		fmt.Printf("key2: %s\n", val)
-	}
-	if _, exists := db.Get("key1"); !exists {
-		fmt.Println("key1 was deleted")
-	}
 }
